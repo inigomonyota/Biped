@@ -1,39 +1,57 @@
 ﻿using Microsoft.Win32;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace biped
 {
-    class SettingsStorage
+    public class SettingsStorage
     {
-        private const string userRoot = "HKEY_CURRENT_USER";
-        private const string subkey = "biped";
-        private const string keyName = userRoot + "\\" + subkey;
+        private const string RegKeyPath = @"Software\Biped";
 
-
-        public void SaveToRegistry(string key, uint value)
+        public void Save(string pedalName, uint value)
         {
-
-            // An int value can be stored without specifying the
-            // registry data type, but long values will be stored
-            // as strings unless you specify the type. Note that
-            // the int is stored in the default name/value
-            // pair.
-            Registry.SetValue(keyName, key, value);
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKeyPath))
+                {
+                    key?.SetValue(pedalName, value, RegistryValueKind.DWord);
+                }
+            }
+            catch { /* silently ignore - not critical */ }
         }
 
-        public uint GetFromRegistry(string key)
+        public uint Load(string pedalName, uint defaultValue = 0)
         {
-            var value =  Registry.GetValue(keyName, key, 0);
-            if (value != null)
+            try
             {
-                return Convert.ToUInt32(value);
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKeyPath))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(pedalName);
+                        if (val is int i) return (uint)i;
+                        if (val != null) return ConvertToUInt32(val);
+                    }
+                }
             }
-            return 0;
+            catch { /* ignore */ }
 
+            return defaultValue;
+        }
+
+        // Helper for safety
+        private static uint ConvertToUInt32(object value)
+        {
+            try { return System.Convert.ToUInt32(value); }
+            catch { return 0; }
+        }
+
+        // Works perfectly on .NET Framework 4.8
+        public void ClearAll()
+        {
+            try
+            {
+                Registry.CurrentUser.DeleteSubKey(RegKeyPath); // throws if not exist → we catch
+            }
+            catch { /* key didn't exist - that's fine */ }
         }
     }
 }

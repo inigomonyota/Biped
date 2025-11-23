@@ -1,9 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Configuration;
-using System.Data;
 using System.Linq;
-using System.Threading.Tasks;
 using System.Windows;
 
 namespace biped
@@ -15,68 +11,102 @@ namespace biped
     {
         private void Application_Startup(object sender, StartupEventArgs e)
         {
+            // 1. Check for silent flag immediately
+            // We accept both /silent and -silent
+            bool silent = e.Args.Any(arg => arg.Equals("/silent", StringComparison.OrdinalIgnoreCase) ||
+                                            arg.Equals("-silent", StringComparison.OrdinalIgnoreCase));
+
+            // 2. Create the window
+            // Note: MainWindow constructor now initializes the hardware immediately.
+            // This ensures pedals work even if we never call .Show()
             MainWindow wnd = new MainWindow();
 
+            // 3. Process Command Line Key Bindings (if any)
             if (e.Args.Length > 0)
             {
                 var cliBindings = ProcessCommandLineArguments(e.Args);
+
+                // Only apply if we got a full set of 3 bindings
                 if (cliBindings.Length == 3)
                 {
                     wnd.ApplyCommandLineBindings(cliBindings[0], cliBindings[1], cliBindings[2]);
                 }
             }
-            wnd.Show();
+
+            // 4. Decide whether to show the UI
+            if (!silent)
+            {
+                wnd.Show();
+            }
+            else
+            {
+                // If silent, we do NOT show the window.
+                // The application keeps running because the MainWindow object exists 
+                // (just hidden), and the System Tray icon (initialized in constructor) keeps it accessible.
+            }
         }
 
         private uint[] ProcessCommandLineArguments(string[] args)
         {
-
             uint leftBinding = uint.MaxValue;
             uint middleBinding = uint.MaxValue;
             uint rightBinding = uint.MaxValue;
             int argIndex = 0;
-            
+
             try
             {
                 while (argIndex < args.Length)
                 {
-                    switch (args[argIndex])
+                    string currentArg = args[argIndex].ToLower();
+
+                    switch (currentArg)
                     {
                         case "-left":
-                            argIndex++;
-                            leftBinding = uint.Parse(args[argIndex]);
+                            if (argIndex + 1 < args.Length)
+                            {
+                                argIndex++;
+                                leftBinding = uint.Parse(args[argIndex]);
+                            }
                             break;
+
                         case "-middle":
-                            argIndex++;
-                            middleBinding = uint.Parse(args[argIndex]);
+                            if (argIndex + 1 < args.Length)
+                            {
+                                argIndex++;
+                                middleBinding = uint.Parse(args[argIndex]);
+                            }
                             break;
+
                         case "-right":
-                            argIndex++;
-                            rightBinding = uint.Parse(args[argIndex]);
+                            if (argIndex + 1 < args.Length)
+                            {
+                                argIndex++;
+                                rightBinding = uint.Parse(args[argIndex]);
+                            }
                             break;
-                        default:
-                            throw new Exception();
+
+                        // Explicitly ignore the silent flag here so it doesn't trigger an error
+                        // (We handled it in Application_Startup)
+                        case "/silent":
+                        case "-silent":
+                            break;
                     }
                     argIndex++;
                 }
 
-                if (leftBinding == uint.MaxValue || middleBinding == uint.MaxValue || rightBinding == uint.MaxValue ) {
-                    MessageBox.Show("Must provide bindings for all three pedals!");
-                    return new uint[0];
+                // Check if we successfully parsed all 3 bindings
+                if (leftBinding != uint.MaxValue && middleBinding != uint.MaxValue && rightBinding != uint.MaxValue)
+                {
+                    return new uint[] { leftBinding, middleBinding, rightBinding };
                 }
             }
-            catch (FormatException)
+            catch (Exception ex)
             {
-                MessageBox.Show("Binding values must be the integer key code!");
-                return new uint[0];
-            }
-            catch (Exception)
-            {
-                MessageBox.Show("Invalid Command Line Parameters!");
-                return new uint[0];
+                MessageBox.Show("Error parsing command line arguments: " + ex.Message);
             }
 
-            return new uint[]{ leftBinding, middleBinding, rightBinding };
+            // Return empty if parsing failed or arguments were incomplete
+            return new uint[0];
         }
     }
 }
