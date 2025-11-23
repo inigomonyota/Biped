@@ -9,51 +9,68 @@ namespace biped
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetMessageExtraInfo();
+
+        // --- EXPLICIT STRUCT LAYOUT (Prevents Memory Bleed) ---
+
         [StructLayout(LayoutKind.Sequential)]
-        struct INPUT { public uint type; public INPUTUNION u; }
+        public struct INPUT
+        {
+            public uint type; // 0=Mouse, 1=Keyboard
+            public InputUnion U;
+            public static int Size => Marshal.SizeOf(typeof(INPUT));
+        }
 
         [StructLayout(LayoutKind.Explicit)]
-        struct INPUTUNION
+        public struct InputUnion
         {
             [FieldOffset(0)] public MOUSEINPUT mi;
             [FieldOffset(0)] public KEYBDINPUT ki;
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        struct MOUSEINPUT
+        public struct KEYBDINPUT
         {
-            public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo;
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        struct KEYBDINPUT
+        public struct MOUSEINPUT
         {
-            public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo;
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
         }
+
+        // --- CONSTANTS ---
+        const uint INPUT_MOUSE = 0;
+        const uint INPUT_KEYBOARD = 1;
 
         const uint KEYEVENTF_SCANCODE = 0x0008;
         const uint KEYEVENTF_KEYUP = 0x0002;
 
-        // Virtual Key Codes for Modifiers
-        const ushort VK_SHIFT = 0x10;
-        const ushort VK_CONTROL = 0x11;
-        const ushort VK_MENU = 0x12; // Alt
-        const ushort VK_LWIN = 0x5B;
-
-        // Inside Input.cs
+        // --- METHODS ---
 
         public void SendKey(uint packedCode, bool keyUp)
         {
             var inputs = new List<INPUT>();
 
-            // 1. Unpack
+            // 1. Unpack Modifiers
             uint keyCode = packedCode & ModifierMasks.KEY_MASK;
             bool hasShift = (packedCode & ModifierMasks.SHIFT) != 0;
             bool hasCtrl = (packedCode & ModifierMasks.CTRL) != 0;
             bool hasAlt = (packedCode & ModifierMasks.ALT) != 0;
             bool hasWin = (packedCode & ModifierMasks.WIN) != 0;
 
-            // 2. Modifiers Down
+            // 2. Modifiers Down (Pressed before the main key)
             if (!keyUp)
             {
                 if (hasShift) AddKey(inputs, 0x10, false); // VK_SHIFT
@@ -63,17 +80,17 @@ namespace biped
             }
 
             // 3. Main Key OR Mouse Button
-            // FIX: Check for the new high-range Mouse IDs
             if (keyCode >= 0xFF01 && keyCode <= 0xFF03)
             {
                 AddMouse(inputs, keyCode, keyUp);
             }
             else if (keyCode > 0)
             {
+                // Prefer ScanCodes for games, but use VK logic inside helper
                 AddScanKey(inputs, keyCode, keyUp);
             }
 
-            // 4. Modifiers Up
+            // 4. Modifiers Up (Released after the main key)
             if (keyUp)
             {
                 if (hasWin) AddKey(inputs, 0x5B, true);
@@ -83,40 +100,49 @@ namespace biped
             }
 
             if (inputs.Count > 0)
-                SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+            {
+                SendInput((uint)inputs.Count, inputs.ToArray(), INPUT.Size);
+            }
         }
 
         private void AddScanKey(List<INPUT> list, uint scancode, bool keyUp)
         {
-            list.Add(new INPUT
+            var input = new INPUT
             {
-                type = 1, // Keyboard
-                u = new INPUTUNION
+                type = INPUT_KEYBOARD,
+                U = new InputUnion
                 {
                     ki = new KEYBDINPUT
                     {
                         wScan = (ushort)scancode,
-                        dwFlags = KEYEVENTF_SCANCODE | (uint)(keyUp ? KEYEVENTF_KEYUP : 0)
+                        wVk = 0, // Must be 0 when using ScanCode flag
+                        dwFlags = KEYEVENTF_SCANCODE | (uint)(keyUp ? KEYEVENTF_KEYUP : 0),
+                        time = 0,
+                        dwExtraInfo = GetMessageExtraInfo()
                     }
                 }
-            });
+            };
+            list.Add(input);
         }
 
-        // Helper for Modifiers (using Virtual Keys, not Scancodes, for safety)
         private void AddKey(List<INPUT> list, ushort vk, bool keyUp)
         {
-            list.Add(new INPUT
+            var input = new INPUT
             {
-                type = 1,
-                u = new INPUTUNION
+                type = INPUT_KEYBOARD,
+                U = new InputUnion
                 {
                     ki = new KEYBDINPUT
                     {
                         wVk = vk,
-                        dwFlags = (uint)(keyUp ? KEYEVENTF_KEYUP : 0)
+                        wScan = 0,
+                        dwFlags = (uint)(keyUp ? KEYEVENTF_KEYUP : 0),
+                        time = 0,
+                        dwExtraInfo = GetMessageExtraInfo()
                     }
                 }
-            });
+            };
+            list.Add(input);
         }
 
         private void AddMouse(List<INPUT> list, uint code, bool keyUp)
@@ -136,26 +162,33 @@ namespace biped
                 case CustomButtons.MouseRight: flag = keyUp ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_RIGHTDOWN; break;
             }
 
-            list.Add(new INPUT
+            var input = new INPUT
             {
-                type = 0,
-                u = new INPUTUNION { mi = new MOUSEINPUT { dwFlags = flag } }
-            });
+                type = INPUT_MOUSE,
+                U = new InputUnion
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dwFlags = flag,
+                        dx = 0,
+                        dy = 0,
+                        mouseData = 0,
+                        time = 0,
+                        dwExtraInfo = GetMessageExtraInfo()
+                    }
+                }
+            };
+            list.Add(input);
         }
 
         public void ReleaseAllModifiers()
         {
-            // Manually send UP events for all common modifiers to unstick them
-            // if the app crashed or exited weirdly previously.
             var inputs = new List<INPUT>();
-
             AddKey(inputs, 0x10, true); // Shift
             AddKey(inputs, 0x11, true); // Ctrl
             AddKey(inputs, 0x12, true); // Alt
             AddKey(inputs, 0x5B, true); // LWin
-
-            if (inputs.Count > 0)
-                SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+            if (inputs.Count > 0) SendInput((uint)inputs.Count, inputs.ToArray(), INPUT.Size);
         }
     }
 }

@@ -1,12 +1,14 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Runtime.InteropServices;
-using System.Windows.Media;
 using System.Windows.Interop;
-
-// Aliases to handle the Tray Icon and Graphics
+using System.Windows.Media;
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
 
@@ -14,27 +16,30 @@ namespace biped
 {
     public partial class MainWindow : Window
     {
-        private readonly SettingsStorage settings = new SettingsStorage();
+        // --- PATHS ---
+        private string ConfigDirectory => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cfg");
+        private string DefaultProfilePath => Path.Combine(ConfigDirectory, "default.cfg");
+        private string currentProfilePath;
+
+        // --- STATE ---
         private MultiBiped multiBiped;
         private BipedDevice currentDevice;
-        private Config config;
-
         private Pedal currentPedal = Pedal.NONE;
         private DateTime bindingStartTime = DateTime.MinValue;
 
-        // Tray Icon Components
+        // --- TRAY ---
         private WinForms.NotifyIcon trayIcon;
         private bool isExiting = false;
+
+        private readonly System.Timers.Timer _statusTimer = new System.Timers.Timer(2500) { AutoReset = false };
 
         public MainWindow()
         {
             InitializeComponent();
             InitializeTrayIcon();
-
-            // MOVED: We no longer wait for "Loaded". We start immediately.
             InitializeHardware();
 
-            // Handle Closing to minimize instead of exit
+            // Minimize to tray
             Closing += (s, e) =>
             {
                 if (!isExiting)
@@ -45,170 +50,433 @@ namespace biped
                 }
             };
 
+            // Cancel binding when window loses focus
+            Deactivated += (s, e) =>
+            {
+                if (currentPedal != Pedal.NONE)
+                    CancelBinding();
+            };
+
+            // Make Actions button open dropdown on left click
+            MapButton.Click += (s, e) =>
+            {
+                if (MapButton.ContextMenu != null)
+                {
+                    MapButton.ContextMenu.PlacementTarget = MapButton;
+                    MapButton.ContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+                    MapButton.ContextMenu.IsOpen = true;
+                    e.Handled = true;
+                }
+            };
+
+            // Subtle hover effect
+            MapButton.MouseEnter += (s, e) => MapButton.Background = new SolidColorBrush(Color.FromRgb(245, 245, 245));
+            MapButton.MouseLeave += (s, e) => MapButton.Background = Brushes.White;
+
             this.PreviewMouseDown += OnGlobalMouseDown;
 
-        }
-
-        private void InitializeTrayIcon()
-        {
-            trayIcon = new WinForms.NotifyIcon();
-
-            // Try to use the EXE's own icon. If that fails, it will just be blank (but functional)
-            try
+            _statusTimer.Elapsed += (s, e) =>
             {
-                trayIcon.Icon = Drawing.Icon.ExtractAssociatedIcon(System.Reflection.Assembly.GetEntryAssembly().Location);
-            }
-            catch { /* ignore */ }
-
-            trayIcon.Text = "Biped Pedal Mapper";
-            trayIcon.Visible = true;
-
-            // Double-click the tray icon to bring window back
-            trayIcon.DoubleClick += (s, e) => ShowWindow();
-
-            // Right-click Context Menu
-            var menu = new WinForms.ContextMenuStrip();
-            menu.Items.Add("Configure Pedals", null, (s, e) => ShowWindow());
-            menu.Items.Add("-"); // Separator
-            menu.Items.Add("Exit Biped", null, (s, e) => ExitApp());
-
-            trayIcon.ContextMenuStrip = menu;
-        }
-        protected override void OnSourceInitialized(EventArgs e)
-        {
-            base.OnSourceInitialized(e);
-            HwndSource source = PresentationSource.FromVisual(this) as HwndSource;
-            source?.AddHook(WndProc);
-        }
-
-        private const int WM_DEVICECHANGE = 0x0219;
-
-        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
-        {
-            // If Windows says "Hardware changed" (plug or unplug)
-            if (msg == WM_DEVICECHANGE)
-            {
-                // Optional: Check if we are currently binding. 
-                // If we are, we might want to cancel it to prevent errors if the device was unplugged.
-                if (currentPedal != Pedal.NONE)
+                Dispatcher.Invoke(() =>
                 {
-                    CancelBinding();
-                }
-
-                // Force a rescan
-                // We use a small DispatcherTimer or Delay to allow the OS 
-                // a moment to finalize the driver loading before we try to open it.
-                Dispatcher.InvokeAsync(async () =>
-                {
-                    await System.Threading.Tasks.Task.Delay(500); // Wait 0.5s for drivers to settle
-                    RefreshDeviceList();
+                    if (StatusText.Text != "Ready.") // only reset if we changed it
+                        StatusText.Text = "Ready.";
                 });
-            }
-
-            return IntPtr.Zero;
+            };
         }
 
-        private void ShowWindow()
+        // ---------------------------------------------------------
+        // INITIALIZATION
+        // ---------------------------------------------------------
+        private void InitializeHardware(string preferredIdToSelect = null)
         {
-            Show();
-            WindowState = WindowState.Normal;
-            Activate();
-        }
+            string idToRestore = preferredIdToSelect ?? (currentDevice != null ? currentDevice.UniqueId : null);
 
-        private void ExitApp()
-        {
-            isExiting = true;
-
-            // SAFETY: Release any modifiers (Shift/Ctrl/Alt) that might be stuck
             new Input().ReleaseAllModifiers();
-
-            trayIcon.Visible = false;
-            trayIcon.Dispose();
-            Application.Current.Shutdown();
-        }
-
-        private void InitializeHardware()
-        {
-            // Safety: Unstick any keys
-            new Input().ReleaseAllModifiers();
+            if (!Directory.Exists(ConfigDirectory)) Directory.CreateDirectory(ConfigDirectory);
 
             multiBiped = new MultiBiped();
             multiBiped.PedalPressed += OnPhysicalPedalPress;
 
-            RefreshDeviceList();
+            DeviceSelector.Items.Clear();
+            foreach (var dev in multiBiped.Devices)
+                DeviceSelector.Items.Add(dev);
 
-            if (multiBiped.Devices.Count == 0)
-                StatusText.Text = "No pedal detected – plug it in!";
+            BipedDevice deviceToSelect = null;
+            if (!string.IsNullOrEmpty(idToRestore))
+            {
+                foreach (BipedDevice d in multiBiped.Devices)
+                {
+                    if (string.Equals(d.UniqueId, idToRestore, StringComparison.OrdinalIgnoreCase))
+                    {
+                        deviceToSelect = d;
+                        break;
+                    }
+                }
+            }
+
+            if (deviceToSelect == null && multiBiped.Devices.Count > 0)
+                deviceToSelect = multiBiped.Devices[0];
+
+            if (deviceToSelect != null)
+            {
+                DeviceSelector.SelectedItem = deviceToSelect;
+                currentDevice = deviceToSelect;
+            }
             else
-                SelectDevice(multiBiped.Devices[0]);
+            {
+                SetStatus("No pedal detected – plug it in!");
+                currentDevice = null;
+            }
+
+            currentProfilePath = DefaultProfilePath;
+            if (File.Exists(DefaultProfilePath))
+                ApplyGameProfile(DefaultProfilePath);
+            else
+            {
+                ProfileLoader.Save(DefaultProfilePath, new List<BipedDevice>());
+                SetStatus("Active Profile: default (New)");
+            }
+
+            RefreshProfileList();
+            SelectDevice(currentDevice);
         }
 
+        // ---------------------------------------------------------
+        // PROFILE MANAGEMENT
+        // ---------------------------------------------------------
+        private void RefreshProfileList()
+        {
+            ProfileSelector.SelectionChanged -= ProfileSelector_SelectionChanged;
+            ProfileSelector.Items.Clear();
+            ProfileSelector.Items.Add("default");
+
+            if (Directory.Exists(ConfigDirectory))
+            {
+                string[] files = Directory.GetFiles(ConfigDirectory, "*.cfg");
+                foreach (string file in files)
+                {
+                    string name = Path.GetFileNameWithoutExtension(file);
+                    if (!name.Equals("default", StringComparison.OrdinalIgnoreCase))
+                        ProfileSelector.Items.Add(name);
+                }
+            }
+
+            string currentName = Path.GetFileNameWithoutExtension(currentProfilePath);
+            ProfileSelector.SelectedItem = currentName;
+            if (ProfileSelector.SelectedIndex == -1) ProfileSelector.SelectedIndex = 0;
+
+            ProfileSelector.SelectionChanged += ProfileSelector_SelectionChanged;
+        }
+
+        private void ProfileSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            string selected = ProfileSelector.SelectedItem as string;
+            if (string.IsNullOrEmpty(selected)) return;
+
+            string path = Path.Combine(ConfigDirectory, selected + ".cfg");
+            if (path != currentProfilePath)
+                ApplyGameProfile(path);
+        }
+
+        public void ApplyGameProfile(string filePath)
+        {
+            currentProfilePath = filePath;
+            var profile = ProfileLoader.Load(filePath);
+            var input = new Input();
+
+            foreach (var d in multiBiped.Devices)
+            {
+                if (d.Config != null)
+                {
+                    if (d.LatchedLeft) input.SendKey(d.Config.Left, true);
+                    if (d.LatchedMiddle) input.SendKey(d.Config.Middle, true);
+                    if (d.LatchedRight) input.SendKey(d.Config.Right, true);
+                }
+                d.LatchedLeft = d.LatchedMiddle = d.LatchedRight = false;
+                d.Config = new Config(0, 0, 0);
+            }
+
+            foreach (var dev in multiBiped.Devices)
+            {
+                Config cfg;
+                if (profile.PositionBindings.TryGetValue(dev.Number, out cfg))
+                    dev.Config = cfg;
+            }
+
+            if (currentDevice != null) SelectDevice(currentDevice);
+
+            string name = Path.GetFileNameWithoutExtension(filePath);
+            ProfileSelector.SelectionChanged -= ProfileSelector_SelectionChanged;
+            ProfileSelector.SelectedItem = name;
+            ProfileSelector.SelectionChanged += ProfileSelector_SelectionChanged;
+
+            UpdateLabels();
+            UpdateClearButtonState();
+            RefreshMapMenuState();
+            SetStatus("Loaded: " + name);
+        }
+
+        private void NewProfile_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new Microsoft.Win32.SaveFileDialog
+            {
+                Filter = "Config Files (*.cfg)|*.cfg",
+                DefaultExt = ".cfg",
+                InitialDirectory = ConfigDirectory,
+                Title = "Create New Blank Profile"
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                ProfileLoader.Save(dialog.FileName, new List<BipedDevice>());
+                RefreshProfileList();
+                ApplyGameProfile(dialog.FileName);
+            }
+        }
+
+        private void DeleteProfile_Click(object sender, RoutedEventArgs e)
+        {
+            string name = Path.GetFileNameWithoutExtension(currentProfilePath);
+            if (name.Equals("default", StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show("You cannot delete the default profile.", "Restricted", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (MessageBox.Show($"Are you sure you want to delete profile '{name}'?\nThis cannot be undone.",
+                "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+            {
+                try
+                {
+                    File.Delete(currentProfilePath);
+                    currentProfilePath = DefaultProfilePath;
+                    ApplyGameProfile(DefaultProfilePath);
+                    RefreshProfileList();
+                    SetStatus("Profile deleted. Switched to default.");
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Error deleting file: " + ex.Message);
+                }
+            }
+        }
+
+        private void OpenFolder_Click(object sender, RoutedEventArgs e)
+        {
+            System.Diagnostics.Process.Start("explorer.exe", ConfigDirectory);
+        }
+
+        // ---------------------------------------------------------
+        // HARDWARE MAPPING
+        // ---------------------------------------------------------
+        private void RefreshMapMenuState()
+        {
+            if (currentDevice == null)
+            {
+                foreach (MenuItem mi in MapContextMenu.Items.OfType<MenuItem>())
+                    mi.IsEnabled = false;
+                UnmapMenuItem.IsEnabled = false;
+                return;
+            }
+
+            bool isMapped = currentDevice.Number < 100;
+            int currentPos = currentDevice.Number;
+
+            UnmapMenuItem.IsEnabled = isMapped;
+
+            foreach (MenuItem item in MapContextMenu.Items.OfType<MenuItem>())
+            {
+                string tag = item.Tag as string;
+                int pos;
+                if (!int.TryParse(tag, out pos)) continue;
+
+                bool taken = false;
+                foreach (BipedDevice d in multiBiped.Devices)
+                {
+                    if (d.Number == pos)
+                    {
+                        taken = true;
+                        break;
+                    }
+                }
+
+                bool takenByMe = isMapped && currentPos == pos;
+                bool disabled = taken && !takenByMe;
+
+                item.IsEnabled = !disabled;
+                item.Foreground = disabled ? Brushes.Gray : Brushes.Black;
+
+                if (takenByMe)
+                    item.Header = $"Position {pos} (Current)";
+                else if (disabled)
+                    item.Header = $"Position {pos} (Occupied)";
+                else
+                    item.Header = $"Map to Position {pos}";
+            }
+        }
+
+        private void DeviceSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            BipedDevice dev = DeviceSelector.SelectedItem as BipedDevice;
+            if (dev != null)
+                SelectDevice(dev);
+        }
+
+        private void SelectDevice(BipedDevice dev)
+        {
+            currentDevice = dev;
+            if (dev != null && dev.Config == null)
+                dev.Config = new Config(0, 0, 0);
+
+            if (dev != null)
+            {
+                DeviceDetailText.Text = $"ID: {dev.ShortId}";
+                DeviceDetailText.ToolTip = dev.Path;
+            }
+            else
+            {
+                DeviceDetailText.Text = "ID: ...";
+                DeviceDetailText.ToolTip = null;
+            }
+
+            UpdateLabels();
+            UpdateClearButtonState();
+            RefreshMapMenuState();
+        }
+
+        private void MapMenu_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentDevice == null) return;
+
+            MenuItem item = sender as MenuItem;
+            string id = currentDevice.UniqueId;
+
+            if (item.Tag != null && item.Tag.ToString() == "unmap")
+            {
+                HardwareMap.UnmapDevice(id);
+                SetStatus("Device unmapped.");
+            }
+            else
+            {
+                int pos;
+                if (int.TryParse(item.Tag.ToString(), out pos))
+                {
+                    HardwareMap.AssignDeviceToPosition(pos, id);
+                    SetStatus($"Device mapped to Position {pos}!");
+                }
+            }
+
+            InitializeHardware(id);
+            RefreshMapMenuState();
+        }
+
+        private void ClearBindings_Click(object sender, RoutedEventArgs e)
+        {
+            if (currentDevice == null || currentDevice.Number >= 100)
+            {
+                SetStatus("No mapped device selected.");
+                return;
+            }
+
+            string profile = Path.GetFileNameWithoutExtension(currentProfilePath);
+            if (MessageBox.Show(
+                $"Are you sure you want to clear all bindings for\n({currentDevice})\nin profile \"{profile}\"?",
+                "Clear All Bindings", MessageBoxButton.YesNo, MessageBoxImage.Question,
+                MessageBoxResult.No) != MessageBoxResult.Yes)
+            {
+                SetStatus("Clear cancelled.");
+                return;
+            }
+
+            currentDevice.Config = new Config(0, 0, 0);
+            UpdateLabels();
+            ProfileLoader.Save(currentProfilePath, multiBiped.Devices);
+            SetStatus($"Cleared all bindings for {currentDevice}");
+        }
+
+        private void UpdateLabels()
+        {
+            if (currentDevice == null || currentDevice.Config == null)
+            {
+                LeftText.Text = "None";
+                MiddleText.Text = "None";
+                RightText.Text = "None";
+                return;
+            }
+
+            LeftText.Text = GetDisplay(currentDevice.Config.Left);
+            MiddleText.Text = GetDisplay(currentDevice.Config.Middle);
+            RightText.Text = GetDisplay(currentDevice.Config.Right);
+        }
+
+        private void UpdateClearButtonState()
+        {
+            ClearBindingsButton.IsEnabled = currentDevice != null && currentDevice.Number < 100;
+        }
+
+        // ---------------------------------------------------------
+        // BINDING LOGIC
+        // ---------------------------------------------------------
         private void OnPhysicalPedalPress(BipedDevice dev, Pedal p)
         {
             Dispatcher.Invoke(() =>
             {
-                // 1. If the window is hidden (minimized to tray), ignore everything
-                if (Visibility != Visibility.Visible) return;
-
-                // 2. STRICT CHECK:
-                // If the pedal that was just pressed (dev) is NOT the one currently 
-                // selected in the dropdown (currentDevice), IGNORE IT completely.
-                if (currentDevice == null || dev != currentDevice)
-                {
+                if (Visibility != Visibility.Visible || !IsActive || currentDevice == null || dev != currentDevice || currentPedal != Pedal.NONE)
                     return;
-                }
 
-                // 3. If we are already busy binding a key, don't restart the process
-                // (This prevents rapid-fire triggering if you hold the pedal down)
-                if (currentPedal != Pedal.NONE)
-                {
-                    return;
-                }
-
-                // 4. If we passed checks, start binding for the SELECTED device only.
                 StartBinding(p);
             });
         }
-        private void SetUiLocked(bool locked)
-        {
-            // If locked is true, disable the controls. 
-            // If locked is false, enable them.
-            DeviceSelector.IsEnabled = !locked;
-            ResetButton.IsEnabled = !locked;
 
-            // Optional: Visually dim the controls slightly if you want, 
-            // but IsEnabled usually handles that automatically in WPF.
-        }
         private void StartBinding(Pedal pedal)
         {
+            if (currentDevice.Number >= 100)
+            {
+                MessageBox.Show(
+                    "This device is not mapped to a Position yet.\n\nPlease use the 'Actions' button to assign it to a Position (e.g., Position 1 for Left, Position 2 for Right) before binding keys.",
+                    "Device Unmapped", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
             currentPedal = pedal;
             bindingStartTime = DateTime.Now;
-
             SetUiLocked(true);
+            foreach (var d in multiBiped.Devices) d.SuppressOutput = true;
 
-            foreach (var d in multiBiped.Devices)
-            {
-                d.SuppressOutput = true;
-            }
-
-            StatusText.Text = "Press any key to bind (or Del to unbind)";
-
+            SetStatus($"Editing Position {currentDevice.Number} - {ToFriendlyName(pedal)}...");
             HighlightPedal(pedal);
         }
-        private void HighlightPedal(Pedal p)
-        {
-            LeftText.Background = Brushes.Transparent;
-            MiddleText.Background = Brushes.Transparent;
-            RightText.Background = Brushes.Transparent;
 
-            switch (p)
-            {
-                case Pedal.LEFT: LeftText.Background = Brushes.LightSkyBlue; break;
-                case Pedal.MIDDLE: MiddleText.Background = Brushes.LightSkyBlue; break;
-                case Pedal.RIGHT: RightText.Background = Brushes.LightSkyBlue; break;
-            }
+        private void Save(Pedal pedal, uint code)
+        {
+            if (pedal == Pedal.LEFT) currentDevice.Config.Left = code;
+            else if (pedal == Pedal.MIDDLE) currentDevice.Config.Middle = code;
+            else currentDevice.Config.Right = code;
+
+            UpdateLabels();
+            ProfileLoader.Save(currentProfilePath, multiBiped.Devices);
+
+            SetUiLocked(false);
+            foreach (var d in multiBiped.Devices) d.SuppressOutput = false;
+
+            SetStatus($"Saved to {ToFriendlyName(pedal)}!");
+            HighlightPedal(Pedal.NONE);
+            currentPedal = Pedal.NONE;
         }
 
+        private void CancelBinding()
+        {
+            currentPedal = Pedal.NONE;
+            SetUiLocked(false);
+            foreach (var d in multiBiped.Devices) d.SuppressOutput = false;
+            SetStatus("Binding cancelled.");
+            HighlightPedal(Pedal.NONE);
+        }
+
+        // ---------------------------------------------------------
+        // INPUT CAPTURE HANDLERS
+        // ---------------------------------------------------------
         private void OnGlobalMouseDown(object sender, MouseButtonEventArgs e)
         {
             if (currentPedal == Pedal.NONE) return;
@@ -224,23 +492,13 @@ namespace biped
 
             if (code != 0)
             {
-                // FIX: Capture modifiers too! (Allows Shift+Click, and handles stuck Shift properly)
                 if ((Keyboard.Modifiers & ModifierKeys.Control) != 0) code |= ModifierMasks.CTRL;
                 if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0) code |= ModifierMasks.SHIFT;
                 if ((Keyboard.Modifiers & ModifierKeys.Alt) != 0) code |= ModifierMasks.ALT;
                 if ((Keyboard.Modifiers & ModifierKeys.Windows) != 0) code |= ModifierMasks.WIN;
-
                 Save(currentPedal, code);
                 e.Handled = true;
             }
-        }
-        private bool IsModifier(Key k)
-        {
-            return k == Key.LeftCtrl || k == Key.RightCtrl ||
-                   k == Key.LeftAlt || k == Key.RightAlt ||
-                   k == Key.LeftShift || k == Key.RightShift ||
-                   k == Key.LWin || k == Key.RWin ||
-                   k == Key.System; // System handles Alt when pressed alone
         }
 
         protected override void OnPreviewKeyDown(KeyEventArgs e)
@@ -249,50 +507,44 @@ namespace biped
             if (currentPedal == Pedal.NONE) { base.OnPreviewKeyDown(e); return; }
             if ((DateTime.Now - bindingStartTime).TotalMilliseconds < 300) return;
             if (e.IsRepeat) { e.Handled = true; return; }
-            if (e.Key == Key.Delete || e.Key == Key.Back) { Save(currentPedal, 0); e.Handled = true; return; }
             if (e.Key == Key.None) return;
 
+            if (e.Key == Key.Delete || e.Key == Key.Back) { Save(currentPedal, 0); e.Handled = true; return; }
+
             Key key = (e.Key == Key.System ? e.SystemKey : e.Key);
+            if (IsModifier(key)) return;
 
-            // IF IT IS A MODIFIER: Do nothing yet. Wait for a normal key or a release.
-            if (IsModifier(key))
-            {
-                return;
-            }
-
-            // IF IT IS A NORMAL KEY (e.g., 'F'): Bind immediately with current modifiers.
             uint code = GetCombinedCode(key);
             Save(currentPedal, code);
             e.Handled = true;
         }
+
         protected override void OnPreviewKeyUp(KeyEventArgs e)
         {
             if (currentPedal == Pedal.NONE) { base.OnPreviewKeyUp(e); return; }
             if ((DateTime.Now - bindingStartTime).TotalMilliseconds < 300) return;
 
             Key key = (e.Key == Key.System ? e.SystemKey : e.Key);
-
-            // IF A MODIFIER IS RELEASED (and we are still binding):
-            // It means the user pressed "Ctrl", didn't press anything else, and let go.
-            // So bind "Ctrl".
             if (IsModifier(key))
             {
-                // We bind the specific modifier key that was released
                 uint code = GetCombinedCode(key);
                 Save(currentPedal, code);
                 e.Handled = true;
             }
         }
 
-        // 4. REUSABLE CODE EXTRACTION
+        private bool IsModifier(Key k)
+        {
+            return k == Key.LeftCtrl || k == Key.RightCtrl || k == Key.LeftAlt || k == Key.RightAlt ||
+                   k == Key.LeftShift || k == Key.RightShift || k == Key.LWin || k == Key.RWin || k == Key.System;
+        }
+
         private uint GetCombinedCode(Key key)
         {
             int vk = KeyInterop.VirtualKeyFromKey(key);
             uint code = MapVirtualKey((uint)vk, 0);
             if (code == 0) code = (uint)vk;
 
-            // If the key ITSELF is not a modifier, add the modifier flags.
-            // (If the key IS LeftCtrl, we don't need to add the Ctrl flag, just the keycode is enough).
             if (!IsModifier(key))
             {
                 if ((Keyboard.Modifiers & ModifierKeys.Control) != 0) code |= ModifierMasks.CTRL;
@@ -300,302 +552,151 @@ namespace biped
                 if ((Keyboard.Modifiers & ModifierKeys.Alt) != 0) code |= ModifierMasks.ALT;
                 if ((Keyboard.Modifiers & ModifierKeys.Windows) != 0) code |= ModifierMasks.WIN;
             }
-
             return code;
-        }
-
-        private void CancelBinding()
-        {
-            currentPedal = Pedal.NONE;
-
-            SetUiLocked(false);
-
-            foreach (var d in multiBiped.Devices) d.SuppressOutput = false;
-
-            StatusText.Text = "Binding cancelled. Press a pedal to edit.";
-
-            HighlightPedal(Pedal.NONE);
-        }
-
-        private async void ResetButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (currentDevice == null) return;
-
-            if (MessageBox.Show("This will unbind all 3 switches on the current pedal.\nContinue?",
-                                "Confirm Reset",
-                                MessageBoxButton.YesNo,
-                                MessageBoxImage.Warning) == MessageBoxResult.Yes)
-            {
-                // 1. Wipe the settings
-                SaveInternal(Pedal.LEFT, 0);
-                SaveInternal(Pedal.MIDDLE, 0);
-                SaveInternal(Pedal.RIGHT, 0);
-
-                // 2. Show the success message
-                string resetMsg = "Device reset! Switches are now unbound.";
-                StatusText.Text = resetMsg;
-
-                // 3. Wait 3 seconds asynchronously (UI stays responsive)
-                await System.Threading.Tasks.Task.Delay(3000);
-
-                // 4. Revert text ONLY if it hasn't changed since we set it.
-                // (This prevents us from overwriting "Editing..." if the user started 
-                //  binding something else while the timer was running).
-                if (StatusText.Text == resetMsg)
-                {
-                    StatusText.Text = "Press a foot pedal to configure it!";
-                }
-            }
-        }
-
-        private void SaveInternal(Pedal pedal, uint code)
-        {
-            string prefix = currentDevice.UniqueId + "_";
-            settings.Save(prefix + pedal.ToString(), code);
-
-            if (pedal == Pedal.LEFT) config.Left = code;
-            else if (pedal == Pedal.MIDDLE) config.Middle = code;
-            else if (pedal == Pedal.RIGHT) config.Right = code;
-
-            currentDevice.Config = config;
-            UpdateLabels();
-        }
-        private void Save(Pedal pedal, uint code)
-        {
-            SaveInternal(pedal, code);
-            SetUiLocked(false);
-            foreach (var d in multiBiped.Devices) d.SuppressOutput = false;
-
-            // SIMPLIFIED SAVED TEXT:
-            StatusText.Text = "Binding saved! Press a pedal to edit.";
-
-            HighlightPedal(Pedal.NONE);
-            currentPedal = Pedal.NONE;
-        }
-        private void RefreshDeviceList()
-{
-    // Store the Unique ID of the currently selected device (if any)
-    string previouslySelectedId = currentDevice?.UniqueId;
-
-    // 1. Tell the backend to close old devices and find new ones
-    multiBiped.RefreshDevices();
-
-    // 2. Update the Dropdown
-    DeviceSelector.Items.Clear();
-    foreach (var dev in multiBiped.Devices)
-    {
-        DeviceSelector.Items.Add(dev);
-    }
-
-    // 3. Try to re-select the device we were looking at
-    if (DeviceSelector.Items.Count > 0)
-    {
-        BipedDevice newSelection = null;
-
-        // Try to find the old device by ID in the NEW list
-        if (!string.IsNullOrEmpty(previouslySelectedId))
-        {
-            foreach(BipedDevice dev in DeviceSelector.Items)
-            {
-                if (dev.UniqueId == previouslySelectedId)
-                {
-                    newSelection = dev;
-                    break;
-                }
-            }
-        }
-
-        // If we found it, select it. If not (e.g. it was unplugged), select the first one.
-        if (newSelection != null)
-        {
-            DeviceSelector.SelectedItem = newSelection;
-        }
-        else
-        {
-            DeviceSelector.SelectedIndex = 0;
-        }
-    }
-    else
-    {
-        // List is empty (all devices unplugged)
-        currentDevice = null;
-        StatusText.Text = "No pedal detected – plug it in!";
-        // Clear labels visually
-        LeftText.Text = "";
-        MiddleText.Text = "";
-        RightText.Text = "";
-    }
-}
-
-        private void DeviceSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (DeviceSelector.SelectedItem is BipedDevice dev)
-                SelectDevice(dev);
-        }
-
-        private void SelectDevice(BipedDevice dev)
-        {
-            currentDevice = dev;
-            string prefix = dev.UniqueId + "_";
-
-            uint l = settings.Load(prefix + "LEFT", 29);
-            uint m = settings.Load(prefix + "MIDDLE", 56);
-            uint r = settings.Load(prefix + "RIGHT", 57);
-
-            config = new Config(l, m, r);
-            dev.Config = config;
-
-            UpdateLabels();
-            StatusText.Text = "Press a foot pedal to configure it!";
-        }
-
-        private void UpdateLabels()
-        {
-            LeftText.Text = GetDisplay(config.Left);
-            MiddleText.Text = GetDisplay(config.Middle);
-            RightText.Text = GetDisplay(config.Right);
-        }
-
-        // Empty handlers to prevent UI clicking
-        private void LeftText_PreviewMouseUp(object sender, MouseButtonEventArgs e) { }
-        private void MiddleText_PreviewMouseUp(object sender, MouseButtonEventArgs e) { }
-        private void RightText_PreviewMouseUp(object sender, MouseButtonEventArgs e) { }
-
-        public void ApplyCommandLineBindings(uint left, uint middle, uint right)
-        {
-            if (currentDevice == null && multiBiped.Devices.Count > 0)
-                SelectDevice(multiBiped.Devices[0]);
-            if (currentDevice == null) return;
-
-            string prefix = currentDevice.UniqueId + "_";
-            settings.Save(prefix + "LEFT", left);
-            settings.Save(prefix + "MIDDLE", middle);
-            settings.Save(prefix + "RIGHT", right);
-
-            config = new Config(left, middle, right);
-            currentDevice.Config = config;
-            UpdateLabels();
-        }
-
-        private string ToFriendlyName(Pedal p)
-        {
-            switch (p)
-            {
-                case Pedal.LEFT: return "Left";
-                case Pedal.MIDDLE: return "Middle";
-                case Pedal.RIGHT: return "Right";
-                default: return p.ToString();
-            }
         }
 
         private string GetDisplay(uint packedCode)
         {
-            // 1. Handle "None"
             if (packedCode == 0) return "None";
 
-            // 2. Build the Modifier String FIRST
             string prefix = "";
             if ((packedCode & ModifierMasks.CTRL) != 0) prefix += "Ctrl + ";
             if ((packedCode & ModifierMasks.SHIFT) != 0) prefix += "Shift + ";
             if ((packedCode & ModifierMasks.ALT) != 0) prefix += "Alt + ";
             if ((packedCode & ModifierMasks.WIN) != 0) prefix += "Win + ";
 
-            // 3. Check Mouse Buttons (High Range)
-            // We do this after building the prefix so we get "Shift + Mouse Left"
             uint baseCode = packedCode & ModifierMasks.KEY_MASK;
 
             if (baseCode == CustomButtons.MouseLeft) return prefix + "Mouse Left";
             if (baseCode == CustomButtons.MouseMiddle) return prefix + "Mouse Middle";
             if (baseCode == CustomButtons.MouseRight) return prefix + "Mouse Right";
 
-            // 4. Map Scancode to WPF Key Enum
             uint vk = MapVirtualKey(baseCode, 1);
-            if (vk == 0) return prefix + baseCode.ToString(); // Fallback
+            if (vk == 0) return prefix + $"Unknown (0x{baseCode:X})";
 
             Key key = KeyInterop.KeyFromVirtualKey((int)vk);
-            string keyName;
+            string keyName = key.ToString();
 
-            // 5. Get a Friendly Name
             switch (key)
             {
-                // --- Numbers ---
-                case Key.D0: keyName = "0"; break;
-                case Key.D1: keyName = "1"; break;
-                case Key.D2: keyName = "2"; break;
-                case Key.D3: keyName = "3"; break;
-                case Key.D4: keyName = "4"; break;
-                case Key.D5: keyName = "5"; break;
-                case Key.D6: keyName = "6"; break;
-                case Key.D7: keyName = "7"; break;
-                case Key.D8: keyName = "8"; break;
-                case Key.D9: keyName = "9"; break;
-
-                // --- Numpad ---
-                case Key.NumPad0: keyName = "Num 0"; break;
-                case Key.NumPad1: keyName = "Num 1"; break;
-                case Key.NumPad2: keyName = "Num 2"; break;
-                case Key.NumPad3: keyName = "Num 3"; break;
-                case Key.NumPad4: keyName = "Num 4"; break;
-                case Key.NumPad5: keyName = "Num 5"; break;
-                case Key.NumPad6: keyName = "Num 6"; break;
-                case Key.NumPad7: keyName = "Num 7"; break;
-                case Key.NumPad8: keyName = "Num 8"; break;
-                case Key.NumPad9: keyName = "Num 9"; break;
-                case Key.Decimal: keyName = "Num ."; break;
-                case Key.Add: keyName = "Num +"; break;
-                case Key.Subtract: keyName = "Num -"; break;
-                case Key.Multiply: keyName = "Num *"; break;
-                case Key.Divide: keyName = "Num /"; break;
-
-                // --- Symbols (Standard US Layout) ---
+                case Key.Back: keyName = "Backspace"; break;
+                case Key.Return: keyName = "Enter"; break;
+                case Key.Capital: keyName = "Caps Lock"; break;
+                case Key.Space: keyName = "Space"; break;
+                case Key.PageUp: keyName = "Page Up"; break;
+                case Key.PageDown: keyName = "Page Down"; break;
+                case Key.Left: keyName = "Left Arrow"; break;
+                case Key.Up: keyName = "Up Arrow"; break;
+                case Key.Right: keyName = "Right Arrow"; break;
+                case Key.Down: keyName = "Down Arrow"; break;
+                case Key.PrintScreen: keyName = "Print Screen"; break;
+                case Key.NumLock: keyName = "Num Lock"; break;
+                case Key.Scroll: keyName = "Scroll Lock"; break;
+                case Key.LeftShift: case Key.RightShift: keyName = "Shift"; break;
+                case Key.LeftCtrl: case Key.RightCtrl: keyName = "Ctrl"; break;
+                case Key.LeftAlt: case Key.RightAlt: keyName = "Alt"; break;
+                case Key.LWin: case Key.RWin: keyName = "Win"; break;
                 case Key.Oem1: keyName = ";"; break;
-                case Key.OemPlus: keyName = "="; break;
+                case Key.OemPlus: keyName = "+"; break;
                 case Key.OemComma: keyName = ","; break;
                 case Key.OemMinus: keyName = "-"; break;
                 case Key.OemPeriod: keyName = "."; break;
                 case Key.OemQuestion: keyName = "/"; break;
                 case Key.OemTilde: keyName = "`"; break;
                 case Key.OemOpenBrackets: keyName = "["; break;
-                case Key.OemPipe: keyName = "\\"; break;
                 case Key.OemCloseBrackets: keyName = "]"; break;
                 case Key.OemQuotes: keyName = "'"; break;
                 case Key.OemBackslash: keyName = "\\"; break;
-
-                // --- Navigation / Editing ---
-                case Key.Return: keyName = "Enter"; break;
-                case Key.Back: keyName = "Backspace"; break;
-                case Key.Space: keyName = "Space"; break;
-                case Key.Tab: keyName = "Tab"; break;
-                case Key.Escape: keyName = "Esc"; break;
-                case Key.Delete: keyName = "Del"; break;
-                case Key.Insert: keyName = "Ins"; break;
-                case Key.Home: keyName = "Home"; break;
-                case Key.End: keyName = "End"; break;
-                case Key.PageUp: keyName = "PgUp"; break;
-                case Key.PageDown: keyName = "PgDn"; break;
-                case Key.Snapshot: keyName = "Print Screen"; break;
-                case Key.Scroll: keyName = "Scroll Lock"; break;
-                case Key.Pause: keyName = "Pause"; break;
-
-                // --- Modifiers (for display cleanup) ---
-                case Key.LeftCtrl: keyName = "Left Ctrl"; break;
-                case Key.RightCtrl: keyName = "Right Ctrl"; break;
-                case Key.LeftShift: keyName = "Left Shift"; break;
-                case Key.RightShift: keyName = "Right Shift"; break;
-                case Key.LeftAlt: keyName = "Left Alt"; break;
-                case Key.RightAlt: keyName = "Right Alt"; break;
-                case Key.LWin: keyName = "Left Win"; break;
-                case Key.RWin: keyName = "Right Win"; break;
-
-                // --- Misc ---
-                case Key.OemFinish: keyName = "No Convert"; break;
-
-                // Default fallthrough (F1-F12, Letters A-Z, etc.)
-                default: keyName = key.ToString(); break;
+                default:
+                    if (key >= Key.D0 && key <= Key.D9) keyName = ((int)(key - Key.D0)).ToString();
+                    else if (key >= Key.NumPad0 && key <= Key.NumPad9) keyName = "Num " + ((int)(key - Key.NumPad0));
+                    else if (key >= Key.F1 && key <= Key.F24) keyName = "F" + ((int)(key - Key.F1 + 1));
+                    break;
             }
 
             return prefix + keyName;
         }
+
+        // ---------------------------------------------------------
+        // UI HELPERS
+        // ---------------------------------------------------------
+        private void SetStatus(string message)
+        {
+            StatusText.Text = message;
+            _statusTimer.Stop();
+            _statusTimer.Start();
+        }
+        private void SetUiLocked(bool locked)
+        {
+            ProfileSelector.IsEnabled = DeviceSelector.IsEnabled = MapButton.IsEnabled = !locked;
+            ClearBindingsButton.IsEnabled = locked ? false : (currentDevice != null && currentDevice.Number < 100);
+        }
+
+        private void HighlightPedal(Pedal p)
+        {
+            LeftBorder.Background = MiddleBorder.Background = RightBorder.Background = Brushes.Transparent;
+            if (p == Pedal.LEFT) LeftBorder.Background = Brushes.LightSkyBlue;
+            else if (p == Pedal.MIDDLE) MiddleBorder.Background = Brushes.LightSkyBlue;
+            else if (p == Pedal.RIGHT) RightBorder.Background = Brushes.LightSkyBlue;
+        }
+
+        private string ToFriendlyName(Pedal p)
+        {
+            if (p == Pedal.LEFT) return "Left";
+            if (p == Pedal.MIDDLE) return "Middle";
+            if (p == Pedal.RIGHT) return "Right";
+            return p.ToString();
+        }
+
+        // ---------------------------------------------------------
+        // TRAY & OS HOOKS
+        // ---------------------------------------------------------
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            HwndSource source = PresentationSource.FromVisual(this) as HwndSource;
+            if (source != null)
+                source.AddHook(WndProc);
+        }
+
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == 0x0219) // WM_DEVICECHANGE
+            {
+                if (currentPedal != Pedal.NONE) CancelBinding();
+                Dispatcher.InvokeAsync(async () =>
+                {
+                    await Task.Delay(500);
+                    InitializeHardware();
+                });
+            }
+            return IntPtr.Zero;
+        }
+
+        private void InitializeTrayIcon()
+        {
+            trayIcon = new WinForms.NotifyIcon();
+            try { trayIcon.Icon = Drawing.Icon.ExtractAssociatedIcon(System.Reflection.Assembly.GetEntryAssembly().Location); }
+            catch { }
+            trayIcon.Text = "Biped";
+            trayIcon.Visible = true;
+            trayIcon.DoubleClick += (s, e) => { Show(); WindowState = WindowState.Normal; Activate(); };
+
+            var menu = new WinForms.ContextMenuStrip();
+            menu.Items.Add("Configure", null, (s, e) => { Show(); WindowState = WindowState.Normal; Activate(); });
+            menu.Items.Add("Exit", null, (s, e) => ExitApp());
+            trayIcon.ContextMenuStrip = menu;
+        }
+
+        private void ExitApp()
+        {
+            isExiting = true;
+            new Input().ReleaseAllModifiers();
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            Application.Current.Shutdown();
+        }
+
         [DllImport("user32.dll")]
         private static extern uint MapVirtualKey(uint uCode, uint uMapType);
     }
