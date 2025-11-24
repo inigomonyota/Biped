@@ -8,7 +8,7 @@ namespace biped
     public class GameProfile
     {
         // Dictionary: [Position ID] -> [Config Object]
-        public Dictionary<int, Config> PositionBindings { get; } = new Dictionary<int, Config>();
+        public Dictionary<int, Config> PedalBindings { get; } = new Dictionary<int, Config>();
     }
 
     public static class ProfileLoader
@@ -29,16 +29,16 @@ namespace biped
                     if (string.IsNullOrWhiteSpace(clean) || clean.StartsWith(";") || clean.StartsWith("#"))
                         continue;
 
-                    // Format: Position1 = 123, 456, 789
+                    // Format: Pedal1 = 123, 456, 789
                     var parts = clean.Split('=');
                     if (parts.Length != 2) continue;
 
                     string key = parts[0].Trim();
                     string val = parts[1].Trim();
 
-                    if (key.StartsWith("Position", StringComparison.OrdinalIgnoreCase))
+                    if (key.StartsWith("Pedal", StringComparison.OrdinalIgnoreCase))
                     {
-                        string numStr = key.Substring(8);
+                        string numStr = key.Substring(5);
                         if (int.TryParse(numStr, out int posID))
                         {
                             var codes = val.Split(',');
@@ -48,7 +48,7 @@ namespace biped
                                     uint.TryParse(codes[1], out uint m) &&
                                     uint.TryParse(codes[2], out uint r))
                                 {
-                                    profile.PositionBindings[posID] = new Config(l, m, r);
+                                    profile.PedalBindings[posID] = new Config(l, m, r);
                                 }
                             }
                         }
@@ -70,7 +70,7 @@ namespace biped
             {
                 writer.WriteLine("; Biped Game Profile");
                 writer.WriteLine($"; Saved: {DateTime.Now}");
-                writer.WriteLine("; Format: PositionX = Left, Middle, Right");
+                writer.WriteLine("; Format: PedalX = Left, Middle, Right");
                 writer.WriteLine("");
 
                 // Sort by Position (1, 2, 3...) so the file is readable
@@ -82,7 +82,7 @@ namespace biped
                     if (dev.Number < 100 && dev.Config != null)
                     {
                         writer.WriteLine($"; {dev}"); // Writes "Position 1" comment
-                        writer.WriteLine($"Position{dev.Number} = {dev.Config.Left}, {dev.Config.Middle}, {dev.Config.Right}");
+                        writer.WriteLine($"Pedal{dev.Number} = {dev.Config.Left}, {dev.Config.Middle}, {dev.Config.Right}");
                         writer.WriteLine("");
                     }
                 }

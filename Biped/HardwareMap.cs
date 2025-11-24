@@ -42,7 +42,7 @@ namespace biped
             _loaded = true;
         }
 
-        public static void AssignDeviceToPosition(int position, string uniqueId)
+        public static void AssignDeviceToPedal(int number, string uniqueId)
         {
             // Ensure directory exists
             string dir = Path.GetDirectoryName(MapFile);
@@ -51,7 +51,7 @@ namespace biped
             EnsureLoaded();
 
             // Update Memory
-            _cache[uniqueId] = position;
+            _cache[uniqueId] = number;
 
             // Save to Disk
             SaveMap();
@@ -70,7 +70,7 @@ namespace biped
         }
         // ---------------------------------------
 
-        public static int GetPositionForDevice(string uniqueId)
+        public static int GetPedalNumber(string uniqueId)
         {
             EnsureLoaded();
             return _cache.ContainsKey(uniqueId) ? _cache[uniqueId] : 0;

@@ -57,23 +57,49 @@ namespace biped
         {
             get
             {
+                // 1. Prefer Serial if available
                 if (!string.IsNullOrEmpty(Serial)) return $"SN: {Serial}";
 
-                // Extract the unique part of the USB path
-                // Path format: \\?\HID#VID_05F3&PID_00FF# 7&2a6b2d4a&0&0000 #{GUID}
+                // 2. Get Hardware Info directly from the device firmware
+                // This is more reliable than parsing the path string.
+                string vid = Device.Attributes.VendorId.ToString("X4"); // Hex format (e.g. 05F3)
+                string pid = Device.Attributes.ProductId.ToString("X4"); // Hex format (e.g. 00FF)
+                string rev = Device.Attributes.Version.ToString("X4");   // Hex format (e.g. 0120)
+
+                // 3. Get the Unique Port ID from the Path
+                string uniquePart = "Unknown";
+
                 if (!string.IsNullOrEmpty(Path))
                 {
-                    var parts = Path.Split('#');
-                    if (parts.Length >= 3) return parts[2];
+                    string clean = Path;
+
+                    // Remove System Prefix
+                    if (clean.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+                        clean = clean.Substring(4);
+
+                    // Remove Trailing GUID
+                    int guidIndex = clean.LastIndexOf("#{");
+                    if (guidIndex > 0)
+                        clean = clean.Substring(0, guidIndex);
+
+                    // Split to find the Instance ID
+                    // Path: HID # VID_... # InstanceID
+                    string[] parts = clean.Split('#');
+                    if (parts.Length >= 3)
+                    {
+                        uniquePart = parts[2];
+                    }
                 }
-                return "Unknown ID";
+
+                // 4. Combine them
+                return $"VID: {vid}  PID: {pid}  REV: {rev}  ID: {uniquePart}";
             }
         }
 
         // MODIFIED: Return ONLY the clean name
         public override string ToString()
         {
-            if (Number < 100) return $"Position {Number}";
+            if (Number < 100) return $"Pedal {Number}";
             return "Unmapped Device";
         }
     }

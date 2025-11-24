@@ -57,18 +57,6 @@ namespace biped
                     CancelBinding();
             };
 
-            // Make Actions button open dropdown on left click
-            MapButton.Click += (s, e) =>
-            {
-                if (MapButton.ContextMenu != null)
-                {
-                    MapButton.ContextMenu.PlacementTarget = MapButton;
-                    MapButton.ContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
-                    MapButton.ContextMenu.IsOpen = true;
-                    e.Handled = true;
-                }
-            };
-
             // Subtle hover effect
             MapButton.MouseEnter += (s, e) => MapButton.Background = new SolidColorBrush(Color.FromRgb(245, 245, 245));
             MapButton.MouseLeave += (s, e) => MapButton.Background = Brushes.White;
@@ -200,7 +188,7 @@ namespace biped
             foreach (var dev in multiBiped.Devices)
             {
                 Config cfg;
-                if (profile.PositionBindings.TryGetValue(dev.Number, out cfg))
+                if (profile.PedalBindings.TryGetValue(dev.Number, out cfg))
                     dev.Config = cfg;
             }
 
@@ -274,27 +262,32 @@ namespace biped
         {
             if (currentDevice == null)
             {
-                foreach (MenuItem mi in MapContextMenu.Items.OfType<MenuItem>())
-                    mi.IsEnabled = false;
+                // Disable everything if no device
+                foreach (MenuItem item in MapContextMenu.Items.OfType<MenuItem>()) item.IsEnabled = false;
                 UnmapMenuItem.IsEnabled = false;
                 return;
             }
 
             bool isMapped = currentDevice.Number < 100;
+
             int currentPos = currentDevice.Number;
 
+            // Only enable Unmap if we are actually mapped
             UnmapMenuItem.IsEnabled = isMapped;
 
             foreach (MenuItem item in MapContextMenu.Items.OfType<MenuItem>())
             {
+                // Skip items that aren't position toggles (like the Unmap button itself)
                 string tag = item.Tag as string;
                 int pos;
                 if (!int.TryParse(tag, out pos)) continue;
 
+                // Check if position is taken by another device
                 bool taken = false;
                 foreach (BipedDevice d in multiBiped.Devices)
                 {
-                    if (d.Number == pos)
+                    // Check if occupied by someone OTHER than me
+                    if (d.Number == pos && d != currentDevice)
                     {
                         taken = true;
                         break;
@@ -302,20 +295,21 @@ namespace biped
                 }
 
                 bool takenByMe = isMapped && currentPos == pos;
+
+                // Disable if taken by someone else
                 bool disabled = taken && !takenByMe;
 
                 item.IsEnabled = !disabled;
                 item.Foreground = disabled ? Brushes.Gray : Brushes.Black;
 
                 if (takenByMe)
-                    item.Header = $"Position {pos} (Current)";
+                    item.Header = $"Pedal {pos} (Current)";
                 else if (disabled)
-                    item.Header = $"Position {pos} (Occupied)";
+                    item.Header = $"Pedal {pos} (Occupied)";
                 else
-                    item.Header = $"Map to Position {pos}";
+                    item.Header = $"Map to Pedal {pos}";
             }
         }
-
         private void DeviceSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             BipedDevice dev = DeviceSelector.SelectedItem as BipedDevice;
@@ -326,23 +320,25 @@ namespace biped
         private void SelectDevice(BipedDevice dev)
         {
             currentDevice = dev;
-            if (dev != null && dev.Config == null)
-                dev.Config = new Config(0, 0, 0);
+            if (dev != null && dev.Config == null) dev.Config = new Config(0, 0, 0);
 
             if (dev != null)
             {
-                DeviceDetailText.Text = $"ID: {dev.ShortId}";
+                DeviceDetailText.Text = $"{dev.ShortId}";
                 DeviceDetailText.ToolTip = dev.Path;
             }
             else
             {
-                DeviceDetailText.Text = "ID: ...";
+                DeviceDetailText.Text = "...";
                 DeviceDetailText.ToolTip = null;
             }
 
+            // REMOVED: The logic that changed MapButton.Content to "Unmap" or "Map"
+            // The button now stays static.
+
             UpdateLabels();
             UpdateClearButtonState();
-            RefreshMapMenuState();
+            RefreshMapMenuState(); // This handles the enabling/disabling of menu items
         }
 
         private void MapMenu_Click(object sender, RoutedEventArgs e)
@@ -362,8 +358,8 @@ namespace biped
                 int pos;
                 if (int.TryParse(item.Tag.ToString(), out pos))
                 {
-                    HardwareMap.AssignDeviceToPosition(pos, id);
-                    SetStatus($"Device mapped to Position {pos}!");
+                    HardwareMap.AssignDeviceToPedal(pos, id);
+                    SetStatus($"Device mapped to Pedal {pos}!");
                 }
             }
 
@@ -434,7 +430,7 @@ namespace biped
             if (currentDevice.Number >= 100)
             {
                 MessageBox.Show(
-                    "This device is not mapped to a Position yet.\n\nPlease use the 'Actions' button to assign it to a Position (e.g., Position 1 for Left, Position 2 for Right) before binding keys.",
+                    "This device is not mapped to a pedal number yet.\n\nPlease use the 'Actions' button to assign it to a pedal number (e.g., Pedal 1 for Left, Pedal 2 2 for Right) before binding keys.",
                     "Device Unmapped", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
@@ -444,7 +440,7 @@ namespace biped
             SetUiLocked(true);
             foreach (var d in multiBiped.Devices) d.SuppressOutput = true;
 
-            SetStatus($"Editing Position {currentDevice.Number} - {ToFriendlyName(pedal)}...");
+            SetStatus($"Editing Pedal {currentDevice.Number} - {ToFriendlyName(pedal)}...");
             HighlightPedal(pedal);
         }
 
@@ -480,6 +476,10 @@ namespace biped
         private void OnGlobalMouseDown(object sender, MouseButtonEventArgs e)
         {
             if (currentPedal == Pedal.NONE) return;
+
+            // Swallow event
+            e.Handled = true;
+
             if ((DateTime.Now - bindingStartTime).TotalMilliseconds < 300) return;
 
             uint code = 0;
@@ -496,43 +496,79 @@ namespace biped
                 if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0) code |= ModifierMasks.SHIFT;
                 if ((Keyboard.Modifiers & ModifierKeys.Alt) != 0) code |= ModifierMasks.ALT;
                 if ((Keyboard.Modifiers & ModifierKeys.Windows) != 0) code |= ModifierMasks.WIN;
+
                 Save(currentPedal, code);
-                e.Handled = true;
             }
         }
-
         protected override void OnPreviewKeyDown(KeyEventArgs e)
         {
-            if (e.Key == Key.Escape && currentPedal != Pedal.NONE) { CancelBinding(); e.Handled = true; return; }
-            if (currentPedal == Pedal.NONE) { base.OnPreviewKeyDown(e); return; }
+            // 1. If not binding, behave normally
+            if (currentPedal == Pedal.NONE)
+            {
+                base.OnPreviewKeyDown(e);
+                return;
+            }
+
+            // 2. CRITICAL: We are in binding mode. We own this event.
+            // Swallow it so it doesn't interact with the UI (Tab, Alt, Space, etc.)
+            e.Handled = true;
+
+            // 3. Handle Escape (Cancel)
+            if (e.Key == Key.Escape)
+            {
+                CancelBinding();
+                return;
+            }
+
+            // 4. Safety Delay (Swallow input, do nothing)
             if ((DateTime.Now - bindingStartTime).TotalMilliseconds < 300) return;
-            if (e.IsRepeat) { e.Handled = true; return; }
+
+            // 5. Ignore Repeats (Swallow input)
+            if (e.IsRepeat) return;
+
+            // 6. Ignore Garbage (Swallow input)
             if (e.Key == Key.None) return;
 
-            if (e.Key == Key.Delete || e.Key == Key.Back) { Save(currentPedal, 0); e.Handled = true; return; }
+            // 7. Handle Unbind (Del/Back)
+            if (e.Key == Key.Delete || e.Key == Key.Back)
+            {
+                Save(currentPedal, 0);
+                return;
+            }
 
+            // 8. Handle Modifiers
             Key key = (e.Key == Key.System ? e.SystemKey : e.Key);
+
+            // If it is just a modifier pressed down (e.g. holding Ctrl), we swallow it and wait.
+            // We will catch the combo on the next key press, OR catch the single modifier on KeyUp.
             if (IsModifier(key)) return;
 
+            // 9. Bind the Key (Normal keys like 'A', 'Tab', 'F1')
             uint code = GetCombinedCode(key);
             Save(currentPedal, code);
-            e.Handled = true;
         }
-
         protected override void OnPreviewKeyUp(KeyEventArgs e)
         {
-            if (currentPedal == Pedal.NONE) { base.OnPreviewKeyUp(e); return; }
+            if (currentPedal == Pedal.NONE)
+            {
+                base.OnPreviewKeyUp(e);
+                return;
+            }
+
+            // Swallow event
+            e.Handled = true;
+
             if ((DateTime.Now - bindingStartTime).TotalMilliseconds < 300) return;
 
             Key key = (e.Key == Key.System ? e.SystemKey : e.Key);
+
+            // We only act on KeyUp if it's a Modifier (binding "Just Ctrl" or "Just Alt")
             if (IsModifier(key))
             {
                 uint code = GetCombinedCode(key);
                 Save(currentPedal, code);
-                e.Handled = true;
             }
         }
-
         private bool IsModifier(Key k)
         {
             return k == Key.LeftCtrl || k == Key.RightCtrl || k == Key.LeftAlt || k == Key.RightAlt ||
@@ -628,8 +664,34 @@ namespace biped
         }
         private void SetUiLocked(bool locked)
         {
-            ProfileSelector.IsEnabled = DeviceSelector.IsEnabled = MapButton.IsEnabled = !locked;
-            ClearBindingsButton.IsEnabled = locked ? false : (currentDevice != null && currentDevice.Number < 100);
+            // If locked (Binding Mode), IsEnabled = false (Grayed out)
+            // If unlocked (Normal Mode), IsEnabled = true (Active)
+            bool enabled = !locked;
+
+            // Disable the containers
+            ProfileHeader.IsEnabled = enabled;
+            HardwareGroup.IsEnabled = enabled;
+            BindingsHeader.IsEnabled = enabled;
+
+            // Important: When we unlock, we must ensure the Clear button 
+            // is correctly set based on the current device state 
+            // (because simply setting BindingsHeader.IsEnabled=true might enable it incorrectly)
+            if (enabled)
+            {
+                UpdateClearButtonState();
+            }
+        }
+        private void MapButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (MapButton.ContextMenu != null)
+            {
+                // Ensure the menu state is fresh before showing it
+                RefreshMapMenuState();
+
+                MapButton.ContextMenu.PlacementTarget = MapButton;
+                MapButton.ContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+                MapButton.ContextMenu.IsOpen = true;
+            }
         }
 
         private void HighlightPedal(Pedal p)

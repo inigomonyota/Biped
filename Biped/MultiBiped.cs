@@ -56,7 +56,7 @@ namespace biped
                 string id = BipedDevice.GetIdFromHid(dev);
 
                 // Ask the Map: "Is this device mapped to a Position?"
-                int pos = HardwareMap.GetPositionForDevice(id);
+                int pos = HardwareMap.GetPedalNumber(id);
 
                 // If not mapped, assign a temporary high ID
                 if (pos == 0) pos = unmappedCounter++;
