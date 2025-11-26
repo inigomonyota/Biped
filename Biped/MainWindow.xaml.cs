@@ -33,6 +33,11 @@ namespace biped
 
         private readonly System.Timers.Timer _statusTimer = new System.Timers.Timer(2500) { AutoReset = false };
 
+        private System.Threading.Timer _saveDebounceTimer;
+        private object _saveLock = new object();
+        private bool _pendingSave = false;
+
+
         public MainWindow()
         {
             InitializeComponent();
@@ -46,6 +51,7 @@ namespace biped
                 {
                     e.Cancel = true;
                     if (currentPedal != Pedal.NONE) CancelBinding();
+                    CleanupSaveTimer();  // Add this line
                     Hide();
                 }
             };
@@ -446,19 +452,89 @@ namespace biped
 
         private void Save(Pedal pedal, uint code)
         {
+            // 1. Update config immediately (in-memory)
             if (pedal == Pedal.LEFT) currentDevice.Config.Left = code;
             else if (pedal == Pedal.MIDDLE) currentDevice.Config.Middle = code;
             else currentDevice.Config.Right = code;
 
+            // 2. Update UI immediately
             UpdateLabels();
-            ProfileLoader.Save(currentProfilePath, multiBiped.Devices);
 
+            // 3. Queue save to disk asynchronously (with debounce)
+            QueueSave();
+
+            // 4. Continue with UI state cleanup
             SetUiLocked(false);
             foreach (var d in multiBiped.Devices) d.SuppressOutput = false;
 
             SetStatus($"Saved to {ToFriendlyName(pedal)}!");
             HighlightPedal(Pedal.NONE);
             currentPedal = Pedal.NONE;
+        }
+
+        // New method: Queue the save with debouncing
+        private void QueueSave()
+        {
+            lock (_saveLock)
+            {
+                _pendingSave = true;
+
+                // If timer is already running, it will pick up the latest state
+                // If not, start it
+                if (_saveDebounceTimer == null)
+                {
+                    _saveDebounceTimer = new System.Threading.Timer(
+                        callback: PerformDebouncedSave,
+                        state: null,
+                        dueTime: 100,  // Wait 100ms to batch multiple saves
+                        period: System.Threading.Timeout.Infinite
+                    );
+                }
+                else
+                {
+                    // Reset the timer
+                    _saveDebounceTimer.Change(100, System.Threading.Timeout.Infinite);
+                }
+            }
+        }
+
+        // New method: Perform the actual save on background thread
+        private void PerformDebouncedSave(object state)
+        {
+            lock (_saveLock)
+            {
+                if (!_pendingSave) return;
+                _pendingSave = false;
+            }
+
+            // This runs on a thread pool thread, NOT the UI thread
+            try
+            {
+                ProfileLoader.Save(currentProfilePath, multiBiped.Devices);
+            }
+            catch (Exception ex)
+            {
+                // Log or handle error - don't crash
+                System.Diagnostics.Debug.WriteLine($"Save error: {ex.Message}");
+            }
+        }
+
+        // Add this to the constructor or cleanup method
+        private void CleanupSaveTimer()
+        {
+            if (_saveDebounceTimer != null)
+            {
+                // Force one final save if pending
+                lock (_saveLock)
+                {
+                    if (_pendingSave)
+                    {
+                        PerformDebouncedSave(null);
+                    }
+                }
+                _saveDebounceTimer.Dispose();
+                _saveDebounceTimer = null;
+            }
         }
 
         private void CancelBinding()
@@ -752,12 +828,14 @@ namespace biped
 
         private void ExitApp()
         {
+            CleanupSaveTimer();  // Add this line
             isExiting = true;
             new Input().ReleaseAllModifiers();
             trayIcon.Visible = false;
             trayIcon.Dispose();
             Application.Current.Shutdown();
         }
+
 
         [DllImport("user32.dll")]
         private static extern uint MapVirtualKey(uint uCode, uint uMapType);
